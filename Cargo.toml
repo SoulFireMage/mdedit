@@ -1,0 +1,16 @@
+[package]
+name = "mdedit"
+version = "0.1.0"
+edition = "2021"
+description = "Side-by-side Markdown editor with live preview (GTK4 + WebKitGTK)"
+license = "MIT"
+
+[dependencies]
+gtk4 = { version = "=0.9.7", features = ["v4_10"] }
+sourceview5 = "=0.9.1"
+webkit6 = "=0.4.0"
+comrak = { version = "0.55", default-features = false }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

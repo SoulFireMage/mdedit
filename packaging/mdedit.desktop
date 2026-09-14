@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=MDEdit
+GenericName=Markdown Editor
+Comment=Side-by-side Markdown editor with live preview
+Exec=/home/richard/mdedit/target/release/mdedit %F
+Icon=mdedit
+Terminal=false
+Categories=Utility;TextEditor;Development;
+MimeType=text/markdown;text/x-markdown;
+StartupNotify=true
+StartupWMClass=org.richard.mdedit
