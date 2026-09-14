@@ -1,5 +1,7 @@
 # MDEdit
 
+***An experiment using Opencode and Deepseek 4.1 as planner and Mercury 2.5 as engineer.***
+
 A native GTK4 markdown editor for Linux with a side-by-side live HTML preview.
 
 - **Left pane** — editable Markdown source using [GtkSourceView 5](https://gitlab.gnome.org/GNOME/gtksourceview)
