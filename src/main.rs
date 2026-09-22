@@ -9,18 +9,24 @@ mod file_ops;
 mod markdown;
 mod preview;
 mod window;
+mod window_state;
 
 use gtk4::gio::prelude::*;
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// Note: `std::env::set_var` below is only sound because it runs before any
+// threads exist (GTK/WebKit spawn theirs later). It becomes `unsafe` in the
+// 2024 edition; keep these calls at the very top of `main`.
 fn main() -> ExitCode {
     // BUG B FIX: Disable WebKit sandbox if AppArmor restricts unprivileged user namespaces.
     // This must run before any GTK/WebKit init.
-    if let Ok(content) = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
+    if let Ok(content) =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+    {
         if content.trim() == "1" {
             std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
         }
@@ -76,22 +82,16 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
-        // Normal GUI launch (optional file path argument).
+        // Normal GUI launch. `app.run()` parses the arguments itself: a file
+        // argument arrives via `open`, no argument via `activate`.
         _ => {
-            let path = args
-                .get(1)
-                .filter(|a| !a.starts_with('-'))
-                .map(PathBuf::from);
-
             let app = gtk4::Application::new(
                 Some("org.richard.mdedit"),
                 gtk4::gio::ApplicationFlags::HANDLES_OPEN,
             );
-            app.connect_activate(move |app| {
-                window::build_ui(app, path.clone());
-            });
-            app.connect_open(move |_app, files, _n_files| {
-                window::build_ui(&_app, files.first().and_then(|f| f.path()));
+            app.connect_activate(|app| window::build_ui(app, None));
+            app.connect_open(|app, files, _hint| {
+                window::build_ui(app, files.first().and_then(|f| f.path()));
             });
             let code = app.run();
             ExitCode::from(code.value() as u8)
@@ -113,22 +113,14 @@ fn print_help() {
 
 /// Headless render: read a file, print the sanitised HTML fragment, exit.
 fn render_file(path: &str) -> ExitCode {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("mdedit: cannot read {path}: {e}");
-            return ExitCode::from(1);
+    match file_ops::read_text_file(Path::new(path)) {
+        Ok(text) => {
+            print!("{}", markdown::render_markdown(&text));
+            ExitCode::SUCCESS
         }
-    };
-    let text = match String::from_utf8(bytes) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("mdedit: {path} is not valid UTF-8: {e}");
-            return ExitCode::from(1);
+        Err(message) => {
+            eprintln!("mdedit: {message}");
+            ExitCode::from(1)
         }
-    };
-    // Normalise CRLF -> LF for consistent rendering.
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    print!("{}", markdown::render_markdown(&text));
-    ExitCode::SUCCESS
+    }
 }

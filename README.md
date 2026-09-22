@@ -12,6 +12,13 @@ A native GTK4 markdown editor for Linux with a side-by-side live HTML preview.
 - **Split** — a draggable `GtkPaned`; the source pane cannot be shrunk to nothing.
 - Light and dark themes follow the GTK/KDE colour-scheme preference.
 - Open / save local `.md` files, with an unsaved-changes prompt on close.
+- The preview follows the editor's scroll position (matched by source line).
+- Links clicked in the preview open in your browser; in-page anchors such as
+  footnotes jump within the preview.
+- If another program changes the open file, MDEdit offers to reload it when
+  its window regains focus.
+- Window size and split position are remembered in
+  `~/.config/mdedit/window.ini`.
 
 ## Requirements
 
@@ -83,7 +90,10 @@ cargo test
 
 The unit tests cover GFM rendering (tables, task lists, strikethrough,
 autolinks) and, importantly, that **raw HTML is escaped and never executed**
-and that `javascript:` links are neutralised.
+and that `javascript:` links are neutralised. They also cover file handling
+(line-ending normalisation, non-UTF-8 rejection, atomic saves that keep
+permissions and write through symlinks). `tests/cli.rs` runs the built binary
+headlessly to check `--render` and `--version`.
 
 ## Safety notes
 
@@ -95,6 +105,11 @@ and that `javascript:` links are neutralised.
 - Files are read as UTF-8; a non-UTF-8 file reports a dialog and leaves the
   current document untouched. CRLF/CR line endings are normalised to LF on
   load and written back as LF.
+- Saves are atomic: the text is written to a temporary file beside the
+  document and renamed over it, so a crash mid-save cannot truncate the file.
+- The preview never navigates away from the document. Link clicks are handed
+  to the desktop's default handler, which also matters because the WebKit
+  sandbox may be disabled (below).
 - Relative image paths resolve against the opened file's directory via the
   WebView base URI.
 - On Ubuntu 24.04 with AppArmor's unprivileged user namespace restriction
@@ -128,7 +143,9 @@ src/app.rs        shared AppState (path, modified, debounce, dark mode)
 src/editor.rs     GtkSourceView 5 editor pane
 src/preview.rs    WebKitGTK 6.0 preview shell + JS injection
 src/window.rs     GtkApplicationWindow: layout, actions, live-preview pipeline
-src/file_ops.rs   file read/write + file/alert dialogs
+src/file_ops.rs   file read/write (atomic save) + file/alert dialogs
+src/window_state.rs  remembered window size / split position
+tests/cli.rs      headless end-to-end tests of the binary
 resources/preview.css  light/dark preview stylesheet
 packaging/        .desktop entry + SVG icon
 ```

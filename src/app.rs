@@ -3,8 +3,9 @@
 //! State is shared via `Rc<AppState>` (single-threaded GTK main loop only).
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use gtk4::glib::SourceId;
 
@@ -30,6 +31,15 @@ pub struct AppState {
     pub loading: Cell<bool>,
     /// A queued action awaiting the outcome of the save prompt.
     pub pending: RefCell<Option<PendingAction>>,
+    /// Word count as of the last preview render (recomputed on the debounce,
+    /// not on every cursor move).
+    pub words: Cell<usize>,
+    /// Modification time of the file when we last loaded or saved it, used to
+    /// detect edits made by other programs.
+    pub disk_mtime: Cell<Option<SystemTime>>,
+    /// Set while the "changed on disk" prompt is showing, so refocusing the
+    /// window does not stack a second one.
+    pub disk_prompt_open: Cell<bool>,
 }
 
 impl AppState {
@@ -41,6 +51,9 @@ impl AppState {
             dark: Cell::new(dark),
             loading: Cell::new(false),
             pending: RefCell::new(None),
+            words: Cell::new(0),
+            disk_mtime: Cell::new(None),
+            disk_prompt_open: Cell::new(false),
         })
     }
 
@@ -53,7 +66,7 @@ impl AppState {
 }
 
 /// Human-readable label for the current document.
-pub fn display_name(path: &Option<PathBuf>) -> String {
+pub fn display_name(path: Option<&Path>) -> String {
     match path {
         Some(p) => p
             .file_name()

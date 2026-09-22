@@ -43,9 +43,13 @@ impl Editor {
         self.buffer.text(&start, &end, false).to_string()
     }
 
-    /// Replace the whole buffer contents.
-    pub fn set_text(&self, text: &str) {
+    /// Replace the whole buffer contents as a load, not an edit: the change
+    /// is kept out of the undo history so Ctrl+Z cannot resurrect the
+    /// previous document.
+    pub fn load_text(&self, text: &str) {
+        self.buffer.begin_irreversible_action();
         self.buffer.set_text(text);
+        self.buffer.end_irreversible_action();
     }
 
     /// 1-based (line, column) of the cursor.
@@ -55,16 +59,16 @@ impl Editor {
         (iter.line() + 1, iter.line_offset() + 1)
     }
 
-    /// Whitespace-separated word count.
-    pub fn word_count(&self) -> usize {
-        self.text().split_whitespace().count()
-    }
-
     /// Move the cursor to the very start of the document.
     pub fn place_cursor_start(&self) {
-        let mut iter = self.buffer.start_iter();
-        self.buffer.place_cursor(&iter);
-        let _ = &mut iter;
+        self.buffer.place_cursor(&self.buffer.start_iter());
+    }
+
+    /// 1-based source line at the top of the visible area.
+    pub fn top_visible_line(&self) -> i32 {
+        let rect = self.view.visible_rect();
+        let (iter, _) = self.view.line_at_y(rect.y());
+        iter.line() + 1
     }
 }
 

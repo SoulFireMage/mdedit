@@ -17,6 +17,7 @@ use crate::editor::Editor;
 use crate::file_ops;
 use crate::markdown;
 use crate::preview::{base_uri_for_path, Preview};
+use crate::window_state::WindowState;
 
 /// Debounce delay between edits and preview refresh.
 const PREVIEW_DEBOUNCE_MS: u64 = 200;
@@ -30,22 +31,25 @@ struct Ui {
     window: ApplicationWindow,
     title: Label,
     status: Label,
+    source_scroll: ScrolledWindow,
     preview_scroll: ScrolledWindow,
+    paned: Paned,
 }
 
 impl Ui {
     fn update_title(&self) {
-        let path = self.state.path.borrow().clone();
-        let name = display_name(&path);
+        let name = display_name(self.state.path.borrow().as_deref());
         let star = if self.state.modified.get() { " *" } else { "" };
         let text = format!("{name}{star}");
         self.title.set_text(&text);
         self.window.set_title(Some(&format!("{text} — MDEdit")));
     }
 
+    /// Cheap enough for every cursor move: the word count is cached by
+    /// `render` rather than recomputed from the whole buffer here.
     fn update_status(&self) {
         let (line, col) = self.editor.cursor_line_col();
-        let words = self.editor.word_count();
+        let words = self.state.words.get();
         self.status
             .set_text(&format!("Ln {line}, Col {col}   ·   {words} words"));
     }
@@ -61,10 +65,7 @@ impl Ui {
                 // This prevents the panic when cancel_debounce() tries to remove
                 // a source that has already fired and been destroyed.
                 *ui.state.debounce.borrow_mut() = None;
-                let text = ui.editor.text();
-                let fragment = markdown::render_markdown(&text);
-                ui.preview.render_fragment(&fragment);
-                ui.update_status();
+                ui.render();
             },
         );
         *self.state.debounce.borrow_mut() = Some(id);
@@ -73,26 +74,49 @@ impl Ui {
     /// Immediately render the current buffer (used after load/save).
     fn refresh_now(&self) {
         self.state.cancel_debounce();
+        self.render();
+    }
+
+    /// Render the buffer into the preview and refresh the cached word count.
+    fn render(&self) {
         let text = self.editor.text();
-        let fragment = markdown::render_markdown(&text);
-        self.preview.render_fragment(&fragment);
+        self.state.words.set(text.split_whitespace().count());
+        self.preview
+            .render_fragment(&markdown::render_preview(&text));
         self.update_status();
+        self.sync_preview_scroll();
+    }
+
+    /// Scroll the preview to match the editor's top visible line.
+    fn sync_preview_scroll(&self) {
+        let adj = self.source_scroll.vadjustment();
+        // Before the editor is first laid out the adjustment is all zeros and
+        // `line_at_y` reports the *last* line, so treat that as the top.
+        if adj.page_size() <= 0.0 {
+            self.preview.scroll_to_line(1, false);
+            return;
+        }
+        // An unscrolled editor is never "at the end", even when the text view
+        // is still measuring lines and `upper` barely exceeds `page_size`.
+        let at_end = adj.value() > 0.0 && adj.value() >= adj.upper() - adj.page_size() - 1.0;
+        self.preview
+            .scroll_to_line(self.editor.top_visible_line(), at_end);
     }
 
     fn open_path(&self, path: PathBuf) {
         match file_ops::read_text_file(&path) {
             Ok(text) => {
                 self.state.loading.set(true);
-                self.editor.set_text(&text);
+                self.editor.load_text(&text);
                 self.editor.place_cursor_start();
                 self.state.loading.set(false);
 
+                self.state.disk_mtime.set(file_ops::modified_time(&path));
                 *self.state.path.borrow_mut() = Some(path.clone());
                 self.state.modified.set(false);
                 self.state.pending.borrow_mut().take();
 
-                self.preview
-                    .reload(Some(base_uri_for_path(&path)), self.state.dark.get());
+                self.preview.reload(Some(base_uri_for_path(&path)));
                 self.refresh_now();
                 self.update_title();
             }
@@ -102,13 +126,14 @@ impl Ui {
 
     fn new_doc(&self) {
         self.state.loading.set(true);
-        self.editor.set_text("");
+        self.editor.load_text("");
         self.state.loading.set(false);
         *self.state.path.borrow_mut() = None;
+        self.state.disk_mtime.set(None);
         self.state.modified.set(false);
         self.state.pending.borrow_mut().take();
 
-        self.preview.reload(None, self.state.dark.get());
+        self.preview.reload(None);
         self.refresh_now();
         self.update_title();
     }
@@ -157,11 +182,12 @@ impl Ui {
         dialog.save(
             Some(&self.window),
             None::<&gio::Cancellable>,
-            move |result| {
-                if let Ok(file) = result {
-                    if let Some(path) = file.path() {
-                        ui.write_to(path);
-                    }
+            move |result| match result.ok().and_then(|file| file.path()) {
+                Some(path) => ui.write_to(path),
+                // Save was abandoned, so whatever was waiting on it (New,
+                // Open, Quit) must not fire on some later, unrelated save.
+                None => {
+                    ui.state.pending.borrow_mut().take();
                 }
             },
         );
@@ -172,17 +198,21 @@ impl Ui {
         match file_ops::write_text_file(&path, &text) {
             Ok(()) => {
                 let path_changed = self.state.path.borrow().as_deref() != Some(path.as_path());
+                self.state.disk_mtime.set(file_ops::modified_time(&path));
                 *self.state.path.borrow_mut() = Some(path.clone());
                 self.state.modified.set(false);
 
                 if path_changed {
-                    self.preview
-                        .reload(Some(base_uri_for_path(&path)), self.state.dark.get());
+                    self.preview.reload(Some(base_uri_for_path(&path)));
                     self.refresh_now();
                 }
                 self.update_title();
 
-                if let Some(action) = self.state.pending.borrow_mut().take() {
+                // Take the action in its own statement: in an `if let` the
+                // `RefCell` borrow would live through the block, and
+                // `new_doc` borrowing `pending` again would panic.
+                let action = self.state.pending.borrow_mut().take();
+                if let Some(action) = action {
                     self.execute_pending(action);
                 }
             }
@@ -203,6 +233,8 @@ impl Ui {
         // macOS-style ordering is not guaranteed; indices: 0 Cancel,
         // 1 Discard, 2 Save (GTK may reorder for the platform).
         dialog.set_buttons(&["Cancel", "Discard", "Save"]);
+        dialog.set_cancel_button(0);
+        dialog.set_default_button(2);
 
         let ui = self.clone();
         dialog.choose(
@@ -249,6 +281,66 @@ impl Ui {
         self.preview_scroll.set_visible(!visible);
     }
 
+    /// If another program changed the file since we loaded or saved it,
+    /// offer to reload it.
+    fn check_disk_changes(&self) {
+        if self.state.disk_prompt_open.get() {
+            return;
+        }
+        let Some(path) = self.state.path.borrow().clone() else {
+            return;
+        };
+        let on_disk = file_ops::modified_time(&path);
+        // A deleted file is left alone: saving will simply recreate it.
+        if on_disk.is_none() || on_disk == self.state.disk_mtime.get() {
+            return;
+        }
+
+        let detail = if self.state.modified.get() {
+            "Another program modified this file. Reloading will discard your unsaved edits."
+        } else {
+            "Another program modified this file."
+        };
+        let dialog = gtk4::AlertDialog::builder()
+            .message(format!("“{}” changed on disk", display_name(Some(&path))))
+            .detail(detail)
+            .modal(true)
+            .build();
+        dialog.set_buttons(&["Keep Mine", "Reload"]);
+        dialog.set_cancel_button(0);
+        dialog.set_default_button(1);
+
+        self.state.disk_prompt_open.set(true);
+        let ui = self.clone();
+        dialog.choose(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                ui.state.disk_prompt_open.set(false);
+                // The prompt may have outlived the document it was about.
+                if ui.state.path.borrow().as_deref() != Some(path.as_path()) {
+                    return;
+                }
+                match result {
+                    Ok(1) => ui.open_path(path),
+                    // Keep ours; don't ask again about this same change.
+                    _ => ui.state.disk_mtime.set(on_disk),
+                }
+            },
+        );
+    }
+
+    fn save_window_state(&self) {
+        let (width, height) = self.window.default_size();
+        WindowState {
+            width,
+            height,
+            maximized: self.window.is_maximized(),
+            split: self.paned.position(),
+        }
+        .save();
+    }
+
     fn set_dark(&self, dark: bool) {
         if self.state.dark.get() == dark {
             return;
@@ -279,12 +371,14 @@ pub fn build_ui(app: &gtk4::Application, startup_file: Option<PathBuf>) {
     let state = AppState::new(dark);
     let editor = Editor::new();
     let preview = Preview::new(dark);
+    let saved = WindowState::load();
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("MDEdit")
-        .default_width(1100)
-        .default_height(720)
+        .default_width(saved.width)
+        .default_height(saved.height)
+        .maximized(saved.maximized)
         .build();
 
     // --- layout -----------------------------------------------------------
@@ -307,7 +401,7 @@ pub fn build_ui(app: &gtk4::Application, startup_file: Option<PathBuf>) {
     paned.set_shrink_start_child(false);
     paned.set_resize_end_child(true);
     paned.set_shrink_end_child(false);
-    paned.set_position(550);
+    paned.set_position(saved.split);
     paned.set_vexpand(true);
 
     let status = Label::new(Some("Ln 1, Col 1   ·   0 words"));
@@ -357,7 +451,9 @@ pub fn build_ui(app: &gtk4::Application, startup_file: Option<PathBuf>) {
         window: window.clone(),
         title,
         status,
+        source_scroll: source_scroll.clone(),
         preview_scroll,
+        paned,
     };
 
     // --- actions ----------------------------------------------------------
@@ -424,6 +520,14 @@ pub fn build_ui(app: &gtk4::Application, startup_file: Option<PathBuf>) {
             .connect_cursor_position_notify(move |_| ui.update_status());
     }
 
+    // --- preview follows the editor's scroll position -------------------
+    {
+        let ui = ui.clone();
+        source_scroll
+            .vadjustment()
+            .connect_value_changed(move |_| ui.sync_preview_scroll());
+    }
+
     // --- theme changes ----------------------------------------------------
     if let Some(settings) = gtk4::Settings::default() {
         let ui_theme = ui.clone();
@@ -438,11 +542,22 @@ pub fn build_ui(app: &gtk4::Application, startup_file: Option<PathBuf>) {
     {
         let ui = ui.clone();
         window.connect_close_request(move |_| {
+            ui.save_window_state();
             if ui.state.modified.get() {
                 ui.confirm_unsaved(PendingAction::Quit);
                 gtk4::glib::Propagation::Stop
             } else {
                 gtk4::glib::Propagation::Proceed
+            }
+        });
+    }
+
+    // --- external edits: check whenever the window regains focus ----------
+    {
+        let ui = ui.clone();
+        window.connect_is_active_notify(move |window| {
+            if window.is_active() {
+                ui.check_disk_changes();
             }
         });
     }
